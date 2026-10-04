@@ -1,7 +1,7 @@
 from io import BytesIO
 import secrets
 import qrcode
-from fastapi import APIRouter,Depends,HTTPException,Request,Response
+from fastapi import APIRouter,Depends,HTTPException,Request,Response,Query
 from sqlalchemy import select,delete
 from sqlalchemy.orm import Session as DBSession
 from .database import get_db
@@ -9,6 +9,7 @@ from .models import User,Church,Membership,Report,MealSlot,MealTrain,RSVP,Event,
 from .schemas import ChurchCreate,Join,MemberUpdate,ReportData
 from .security import current_user,member,digest,set_code,normalize_code,fernet,rate_limit,blocked_ids
 from .notifications import notify
+from .onboarding import invited_church,accept_invitation,canonical_groups,group_options,group_key
 from . import config
 router=APIRouter(prefix='/api',tags=['Churches'])
 
@@ -28,14 +29,29 @@ def create(data:ChurchCreate,request:Request,user:User=Depends(current_user),db:
 @router.post('/churches/join')
 def join(data:Join,user:User=Depends(current_user),db:DBSession=Depends(get_db)):
     rate_limit(db,'join:'+user.id,10)
-    c=db.scalar(select(Church).where(Church.code_hash==digest(normalize_code(data.code))))
-    if not c: raise HTTPException(404,'That invitation is invalid or has been replaced. Ask your church for its current code.')
+    c=invited_church(db,data.code)
+    m=accept_invitation(db,user,c)
+    db.commit(); return {**church_info(c),'status':m.status,'role':m.role}
+
+@router.get('/churches/search')
+def search_churches(q:str=Query(min_length=2,max_length=100),user:User=Depends(current_user),db:DBSession=Depends(get_db)):
+    rate_limit(db,'church-search:'+user.id,60,60)
+    pattern='%'+q.strip().replace('\\','\\\\').replace('%','\\%').replace('_','\\_')+'%'
+    found=db.scalars(select(Church).where(Church.name.ilike(pattern,escape='\\') | Church.location.ilike(pattern,escape='\\')).order_by(Church.name).limit(25)).all()
+    memberships={m.church_id:m for m in db.scalars(select(Membership).where(Membership.user_id==user.id))}
+    return [{'id':c.id,'name':c.name,'location':c.location,'status':memberships[c.id].status if c.id in memberships else None} for c in found]
+
+@router.post('/churches/{church_id}/request-membership')
+def request_membership(church_id:str,user:User=Depends(current_user),db:DBSession=Depends(get_db)):
+    rate_limit(db,'church-request:'+user.id,10,3600)
+    c=db.scalar(select(Church).where(Church.id==church_id).with_for_update())
+    if not c: raise HTTPException(404,'Church not found.')
     m=db.scalar(select(Membership).where(Membership.user_id==user.id,Membership.church_id==c.id))
-    if m and m.status=='removed': raise HTTPException(403,'Please contact a church administrator about membership.')
+    if m and m.status=='removed': raise HTTPException(403,'Please contact a church administrator about your access.')
     if not m:
-        m=Membership(user_id=user.id,church_id=c.id,status='pending' if c.require_approval else 'approved'); db.add(m); db.flush()
+        m=Membership(user_id=user.id,church_id=c.id,status='pending',role='member'); db.add(m); db.flush()
         for admin in db.scalars(select(Membership).where(Membership.church_id==c.id,Membership.status=='approved',Membership.role.in_(['owner','admin']))):
-            notify(db,c.id,admin.user_id,'community','A new member has requested to join',user.name,'/?view=admin',f'join:{m.id}')
+            notify(db,c.id,admin.user_id,'community','A new member has requested to join',user.name,'/?view=admin&church='+c.id,f'join:{m.id}')
     db.commit(); return {**church_info(c),'status':m.status,'role':m.role}
 
 @router.get('/churches/{church_id}/invitation')
@@ -117,12 +133,14 @@ def directory(church_id:str,search:str='',group:str='',user:User=Depends(current
     member(church_id,db,user)
     if len(search)>200 or len(group)>80: raise HTTPException(400,'Search is too long.')
     blocked=blocked_ids(db,user); result=[]
+    options=group_options(db,user,church_id)
     users=db.scalars(select(User).join(Membership,Membership.user_id==User.id).where(Membership.church_id==church_id,Membership.status=='approved').order_by(User.name)).all()
     for u in users:
         p=u.privacy or {}
         if u.id in blocked or not p.get('directory',True): continue
-        if group and group not in (u.groups or []): continue
-        public={'id':u.id,'name':u.name,'bio':u.bio,'skills':u.skills,'resources':u.resources,'groups':u.groups,'available':u.available,'joined':u.created_at.isoformat()+'Z'}
+        labels=canonical_groups(u.groups or [],options)
+        if group and group_key(group) not in {group_key(x) for x in labels}: continue
+        public={'id':u.id,'name':u.name,'bio':u.bio,'skills':u.skills,'resources':u.resources,'groups':labels,'available':u.available,'joined':u.created_at.isoformat()+'Z'}
         for field in ['email','phone','address','household']:
             public[field]=getattr(u,field) if p.get(field,False) else ''
         # Search only fields the member has chosen to disclose.

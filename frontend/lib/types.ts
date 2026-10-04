@@ -1,4 +1,4 @@
-export type View = 'home'|'directory'|'events'|'needs'|'meals'|'commitments'|'inbox'|'settings'|'admin'|'help';
+export type View = 'home'|'directory'|'events'|'needs'|'meals'|'commitments'|'inbox'|'profile'|'settings'|'admin'|'help';
 export type Kind = 'events'|'needs'|'meals';
 export interface Privacy { directory:boolean; email:boolean; phone:boolean; address:boolean; household:boolean }
 export interface Preferences { events:boolean; needs:boolean; meals:boolean; community:boolean; reminders:boolean; in_app:boolean; email:boolean; push:boolean }

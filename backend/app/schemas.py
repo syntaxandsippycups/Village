@@ -12,6 +12,8 @@ class Credentials(Strict):
 class Register(Credentials):
     name: Text120
     accept_terms: Literal[True]
+    invite_code: str = Field(default="", max_length=100)
+    native: bool = False
 class Login(Strict):
     email: EmailStr
     password: str = Field(min_length=1, max_length=256)
@@ -20,6 +22,7 @@ class EmailRequest(Strict):
     email: EmailStr
 class TokenRequest(Strict):
     token: str = Field(min_length=20, max_length=200)
+    native: bool = False
 class Reset(TokenRequest):
     password: str = Field(min_length=12, max_length=256)
 class DeleteAccount(Strict):

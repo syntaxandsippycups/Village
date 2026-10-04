@@ -8,6 +8,7 @@ from .models import User, Session, AuthToken, Membership, Church, MealSlot, Mail
 from .schemas import Register, Login, EmailRequest, TokenRequest, Reset, Profile, Preferences, DeleteAccount
 from .security import current_user, digest, password_hash, password_ok, rate_limit, DUMMY_PASSWORD_HASH
 from .notifications import queue_mail
+from .onboarding import invited_church, accept_invitation, canonical_groups, group_options
 from . import config
 router=APIRouter(prefix='/api/auth',tags=['Account'])
 
@@ -19,6 +20,7 @@ def token_mail(db,user,purpose):
     db.execute(delete(AuthToken).where(AuthToken.user_id==user.id,AuthToken.purpose==purpose))
     db.add(AuthToken(id=digest(token),user_id=user.id,purpose=purpose,expires_at=now()+timedelta(hours=1)))
     url=f'{config.WEB_URL}/?action={purpose}&token={token}'
+    if purpose=='verify': url+='&onboarding=1'
     queue_mail(db,user.email,'Verify your Village email' if purpose=='verify' else 'Reset your Village password',f'Open this link within one hour:\n{url}\n\nIf you did not request this, ignore this email.')
 
 def issue_session(db,user,response,native=False):
@@ -28,16 +30,20 @@ def issue_session(db,user,response,native=False):
     return {'user':private_profile(user),**({'token':token} if native else {})}
 
 @router.post('/register',status_code=201)
-def register(data:Register,request:Request,db:DBSession=Depends(get_db)):
+def register(data:Register,request:Request,response:Response,db:DBSession=Depends(get_db)):
     rate_limit(db,'register-ip:'+request.client.host,1000,3600)
     rate_limit(db,'register-email:'+str(data.email).lower(),3,3600)
     email=str(data.email).lower()
     if db.scalar(select(User).where(User.email==email)): raise HTTPException(409,'An account with that email already exists. Try signing in or resetting your password.')
+    church=invited_church(db,data.invite_code) if data.invite_code else None
     user=User(email=email,name=data.name,password_hash=password_hash(data.password),verified=not config.VERIFY_EMAIL)
     db.add(user); db.flush()
+    if church: accept_invitation(db,user,church)
+    result={}
     if config.VERIFY_EMAIL: token_mail(db,user,'verify')
+    else: result=issue_session(db,user,response,data.native)
     db.commit()
-    return {'message':'Check your email to verify your account, then sign in.' if config.VERIFY_EMAIL else 'Account created. You can sign in now.'}
+    return {**result,'onboarding':True,'message':'Check your email to verify your account. Your church invitation is saved.' if config.VERIFY_EMAIL else 'Welcome to Village. Let’s set up your profile.'}
 
 @router.post('/login')
 def login(data:Login,request:Request,response:Response,db:DBSession=Depends(get_db)):
@@ -71,10 +77,14 @@ def forgot(data:EmailRequest,request:Request,db:DBSession=Depends(get_db)):
     db.commit(); return {'message':'If an eligible account exists, a link has been sent.'}
 
 @router.post('/verify')
-def verify(data:TokenRequest,db:DBSession=Depends(get_db)):
+def verify(data:TokenRequest,response:Response,db:DBSession=Depends(get_db)):
     row=db.get(AuthToken,digest(data.token))
     if not row or row.purpose!='verify' or row.expires_at<now(): raise HTTPException(400,'Verification link expired or invalid.')
-    db.get(User,row.user_id).verified=True; db.delete(row); db.commit(); return {'message':'Email verified. You can sign in.'}
+    user=db.get(User,row.user_id)
+    if not user: raise HTTPException(400,'Verification link expired or invalid.')
+    user.verified=True; db.delete(row)
+    result=issue_session(db,user,response,data.native); db.commit()
+    return {**result,'onboarding':True,'message':'Email verified. Welcome to Village.'}
 
 @router.post('/reset')
 def reset(data:Reset,db:DBSession=Depends(get_db)):
@@ -86,8 +96,17 @@ def reset(data:Reset,db:DBSession=Depends(get_db)):
 
 @router.put('/profile')
 def profile(data:Profile,user:User=Depends(current_user),db:DBSession=Depends(get_db)):
-    for k,v in data.model_dump().items(): setattr(user,k,v)
+    values=data.model_dump()
+    # Lock the church before reading labels so concurrent saves choose one casing.
+    ids=db.scalars(select(Membership.church_id).where(Membership.user_id==user.id,Membership.status=='approved')).all()
+    if ids: db.scalars(select(Church).where(Church.id.in_(ids)).order_by(Church.id).with_for_update()).all()
+    values['groups']=canonical_groups(values['groups'],group_options(db,user))
+    for k,v in values.items(): setattr(user,k,v)
     db.commit(); return private_profile(user)
+
+@router.get('/group-options')
+def groups(user:User=Depends(current_user),db:DBSession=Depends(get_db)):
+    return group_options(db,user)
 
 @router.put('/preferences')
 def preferences(data:Preferences,user:User=Depends(current_user),db:DBSession=Depends(get_db)):
