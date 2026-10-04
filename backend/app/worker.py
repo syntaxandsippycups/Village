@@ -1,4 +1,67 @@
 """Run continuously or invoke --once from a scheduler. Jobs are durable and retry."""
+import argparse,json,logging,smtplib,time
+from email.message import EmailMessage
+from datetime import datetime,timedelta
+from zoneinfo import ZoneInfo
+from sqlalchemy import select,delete
+from .database import SessionLocal
+from .models import Church,MealTrain,MealSlot,Event,RSVP,Need,Volunteer,User,Notification,Mail,Device,Session,AuthToken,RateLimit,Membership,now
+from .notifications import notify
+from . import config
+log=logging.getLogger('village.worker')
+
+def reminders(db):
+    for s,t,c in db.execute(select(MealSlot,MealTrain,Church).join(MealTrain,MealSlot.train_id==MealTrain.id).join(Church,MealTrain.church_id==Church.id).where(MealSlot.user_id!=None,MealSlot.delivered==False,MealTrain.closed==False)):
+        local=datetime.now(ZoneInfo(c.timezone));days=(s.date-local.date()).days
+        # Catch a missed scheduled run later on the same day, without duplicates.
+        if days in [7,1,0] and local.hour>=8:
+            notify(db,c.id,s.user_id,'meals','Your meal commitment is coming up',f'{t.title}: {s.date.isoformat()}. Check delivery details in Village.',f'/?view=meals&id={t.id}&church={c.id}',f'remind-meal:{s.id}:{s.user_id}:{s.date}:{days}',reminder=True)
+    for r,e in db.execute(select(RSVP,Event).join(Event,RSVP.event_id==Event.id).where(Event.cancelled==False,Event.starts_at>now(),Event.starts_at<=now()+timedelta(hours=24))):
+        notify(db,e.church_id,r.user_id,'events','Your event is coming up',e.title,f'/?view=events&id={e.id}&church={e.church_id}',f'remind-event:{e.id}:{e.starts_at.isoformat()}:{r.user_id}',reminder=True)
+    for v,n,c in db.execute(select(Volunteer,Need,Church).join(Need,Volunteer.need_id==Need.id).join(Church,Need.church_id==Church.id).where(Need.status=='open',Need.due_date!=None)):
+        local=datetime.now(ZoneInfo(c.timezone))
+        if n.due_date==local.date()+timedelta(days=1) and local.hour>=8:
+            notify(db,c.id,v.user_id,'needs','Your volunteer commitment is tomorrow',n.title,f'/?view=needs&id={n.id}&church={c.id}',f'remind-need:{n.id}:{n.due_date}:{v.user_id}',reminder=True)
+
+def email_content(subject, body):
+    """Build escaped HTML plus a readable plain-text alternative."""
+    import re
+    from html import escape
+    from urllib.parse import urlsplit, parse_qs
+
+    base = urlsplit(config.WEB_URL)
+    target = None
+    for candidate in re.findall(r'https?://[^\s<>]+', body):
+        parsed = urlsplit(candidate)
+        if (parsed.scheme, parsed.netloc) == (base.scheme, base.netloc):
+            target = candidate
+            break
+
+    action = parse_qs(urlsplit(target).query).get('action', [''])[0] if target else ''
+    is_verify = subject == 'Verify your Village email' and action == 'verify'
+    is_reset = subject == 'Reset your Village password' and action == 'reset'
+    if is_verify:
+        heading = 'Welcome to Village.'
+        paragraphs = [
+            'One small step before you connect with your church family: confirm your email address.',
+            'Select the button below to verify your email and continue setting up your account.',
+        ]
+        button = 'Verify my email'
+        footnote = 'This link expires in one hour. If you did not create a Village account, you can safely ignore this email.'
+    elif is_reset:
+        heading = 'Reset your password.'
+        paragraphs = ['We received a request to reset your Village password.', 'Select the button below to choose a new password.']
+        button = 'Reset my password'
+        footnote = 'This link expires in one hour. If you did not request a reset, ignore this email. Your password will stay the same.'
+    else:
+        heading = subject
+        paragraphs = [line.strip() for line in body.splitlines() if line.strip() and line.strip() != target]
+        button = 'Open Village'
+        footnote = 'You can choose which community updates you receive in Village → Settings.'
+
+    text = 'Village — Your church. Your people. Life together.\n\n' + heading + '\n\n' + '\n\n'.join(paragraphs)
+    if target:
+        text += '\n\n' + button + ':\n' + target
     text += '\n\n' + footnote + '\n\nQuestions? Contact ' + config.SUPPORT_EMAIL
     content = ''.join('<p style="margin:0 0 18px;font-size:16px;line-height:1.65;color:#4c514b;">' + escape(p) + '</p>' for p in paragraphs)
     if target:
